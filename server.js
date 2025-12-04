@@ -13,18 +13,37 @@ const Client = require('./models/Client');
 // IMPORTANT: For Vercel, we need to handle serverless environment
 const isVercel = process.env.VERCEL === '1';
 
-// Multer configuration for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, 'uploads/') // Store files in 'uploads' directory
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// FIXED: Proper multer configuration for Vercel
+let storage;
+let upload;
 
-const upload = multer({ 
+if (isVercel) {
+  // For Vercel: Use memory storage (files stored in memory, not disk)
+  storage = multer.memoryStorage();
+  
+  // Create /tmp/uploads directory for temporary file serving
+  const tmpUploadsPath = '/tmp/uploads';
+  if (!fs.existsSync(tmpUploadsPath)) {
+    fs.mkdirSync(tmpUploadsPath, { recursive: true });
+  }
+} else {
+  // For local development: Use disk storage
+  storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+      const uploadsDir = 'uploads/';
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+      cb(null, uploadsDir);
+    },
+    filename: function (req, file, cb) {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    }
+  });
+}
+
+upload = multer({ 
   storage: storage,
   limits: {
     fileSize: 5 * 1024 * 1024, // 5MB limit
@@ -42,34 +61,21 @@ const upload = multer({
   }
 });
 
-// For Vercel, create uploads directory in /tmp (writable directory)
-if (isVercel) {
-  const tmpUploadsPath = '/tmp/uploads';
-  if (!fs.existsSync(tmpUploadsPath)) {
-    fs.mkdirSync(tmpUploadsPath, { recursive: true });
-  }
-  // Update multer storage for Vercel
-  storage.destination = tmpUploadsPath;
-} else {
-  // Local development
-  if (!fs.existsSync('uploads')) {
-    fs.mkdirSync('uploads');
-  }
-}
-
 const Attendance = require('./models/Attendance');
 const User = require('./models/User');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware - UPDATED CORS
+// Middleware - UPDATED CORS with your actual frontend URL
 app.use(cors({
   origin: [
-    'https://gym-attendance-frontend.vercel.app', // Your frontend URL
+    'https://gym-attendance-frontend.vercel.app', // Your frontend URL - CONFIRM THIS IS CORRECT
     'http://localhost:5173' // Local dev
   ],
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
 
@@ -93,7 +99,11 @@ const connectDB = async () => {
     console.log("🔗 Connecting to MongoDB...");
     
     // Simple connection without complex options
-    await mongoose.connect(mongoURL);
+    await mongoose.connect(mongoURL, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 10000, // 10 seconds timeout
+    });
     
     console.log("✅ MongoDB connected successfully");
     console.log(`📊 Database: ${mongoose.connection.name}`);
@@ -106,10 +116,7 @@ const connectDB = async () => {
     // Try one more time with basic options
     try {
       console.log("🔄 Trying alternative connection method...");
-      await mongoose.connect(mongoURL, {
-        useNewUrlParser: true,
-        useUnifiedTopology: true,
-      });
+      await mongoose.connect(mongoURL);
       console.log("✅ MongoDB connected on second attempt");
       return true;
     } catch (retryError) {
@@ -151,12 +158,53 @@ app.use('/api/clients', require('./routes/clients'));
 app.use('/api/client', require('./routes/client'));
 app.use('/api/trainers', require('./routes/trainers'));
 
+// Add a test upload endpoint for Vercel file handling
+app.post('/api/test-upload', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    let fileInfo;
+    
+    if (isVercel) {
+      // For Vercel: File is in memory buffer
+      fileInfo = {
+        filename: req.file.originalname,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+        storage: 'memory (base64)',
+        base64Preview: req.file.buffer.toString('base64').substring(0, 100) + '...'
+      };
+    } else {
+      // For local: File is on disk
+      fileInfo = {
+        filename: req.file.filename,
+        path: req.file.path,
+        mimetype: req.file.mimetype,
+        size: req.file.size,
+        storage: 'disk'
+      };
+    }
+    
+    res.json({
+      success: true,
+      message: 'File uploaded successfully',
+      file: fileInfo,
+      environment: isVercel ? 'vercel' : 'local'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
     mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    environment: isVercel ? 'vercel' : 'local'
   });
 });
 
@@ -170,7 +218,7 @@ app.get('/api/check-connection', (req, res) => {
     connectionState: mongoose.connection.readyState,
     stateDescription: getStateDescription(mongoose.connection.readyState),
     environment: process.env.NODE_ENV,
-    isVercel: process.env.VERCEL === '1',
+    isVercel: isVercel,
     timestamp: new Date().toISOString(),
     advice: 'If state is 0 (disconnected), check: 1. MongoDB Atlas Network Access (add 0.0.0.0/0) 2. Connection string validity 3. User permissions'
   });
@@ -184,6 +232,7 @@ app.get('/api/debug/env', (req, res) => {
     MONGO_URL_LENGTH: process.env.MONGO_URL?.length,
     VERCEL: process.env.VERCEL,
     PORT: process.env.PORT,
+    isVercel: isVercel,
     // Don't show full MONGO_URL for security
   };
   res.json(envVars);
@@ -261,7 +310,8 @@ app.get('/api/test-mongodb', async (req, res) => {
         stateDescription: 'connected',
         host: mongoose.connection.host,
         database: mongoose.connection.name,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        environment: isVercel ? 'vercel' : 'local'
       });
     } else {
       // Test the connection string directly
@@ -322,6 +372,7 @@ app.get('/', (req, res) => {
         .endpoint { background: #e9ecef; padding: 10px; margin: 10px 0; border-radius: 5px; }
         a { color: #007bff; text-decoration: none; }
         a:hover { text-decoration: underline; }
+        code { background: #f8f9fa; padding: 2px 5px; border-radius: 3px; }
       </style>
     </head>
     <body>
@@ -347,8 +398,42 @@ app.get('/', (req, res) => {
           <a href="/api/debug/env" target="_blank">/api/debug/env</a> - Environment variables
         </div>
         
-        <p><strong>Frontend:</strong> Update your frontend .env to use: <code>VITE_API_URL=https://gym-attendance-backend-2.vercel.app</code></p>
+        <h3>File Upload Test:</h3>
+        <div class="endpoint">
+          <form id="uploadForm">
+            <input type="file" name="image" accept="image/*" required>
+            <button type="submit">Test Upload</button>
+          </form>
+          <div id="uploadResult"></div>
+        </div>
+        
+        <p><strong>Frontend Configuration:</strong></p>
+        <p>Update your frontend .env file with:</p>
+        <code>VITE_API_URL=https://gym-attendance-backend-2.vercel.app</code>
+        
+        <p><strong>Environment:</strong> ${isVercel ? 'Vercel (Serverless)' : 'Local Development'}</p>
       </div>
+      
+      <script>
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+          e.preventDefault();
+          const formData = new FormData();
+          formData.append('image', e.target.image.files[0]);
+          
+          try {
+            const response = await fetch('/api/test-upload', {
+              method: 'POST',
+              body: formData
+            });
+            const result = await response.json();
+            document.getElementById('uploadResult').innerHTML = 
+              '<pre>' + JSON.stringify(result, null, 2) + '</pre>';
+          } catch (error) {
+            document.getElementById('uploadResult').innerHTML = 
+              'Error: ' + error.message;
+          }
+        });
+      </script>
     </body>
     </html>
   `);
