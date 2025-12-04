@@ -69,10 +69,7 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware - UPDATED CORS with your actual frontend URL
 app.use(cors({
-  origin: [
-    'https://gym-attendance-frontend.vercel.app', // Your frontend URL - CONFIRM THIS IS CORRECT
-    'http://localhost:5173' // Local dev
-  ],
+  origin: '*', // Allow all for now, we'll fix this later
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -98,7 +95,6 @@ async function connectToDatabase() {
   try {
     console.log('🔗 Creating new MongoDB connection...');
     
-    // For Vercel, use a simpler connection
     const mongoURL = process.env.MONGO_URL;
     
     if (!mongoURL) {
@@ -109,14 +105,8 @@ async function connectToDatabase() {
     const maskedURL = mongoURL.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@');
     console.log(`📡 Connecting to: ${maskedURL}`);
     
-    // Connect with optimal settings for serverless
-    const connection = await mongoose.connect(mongoURL, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      maxPoolSize: 1, // Important for serverless - keep pool small
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-    });
+    // FIXED: Simple connection without deprecated options
+    const connection = await mongoose.connect(mongoURL);
     
     console.log('✅ MongoDB connected successfully!');
     cachedConnection = connection;
@@ -135,6 +125,7 @@ async function connectToDatabase() {
     return connection;
   } catch (error) {
     console.error('❌ MongoDB connection failed:', error.message);
+    console.error('Full error:', error);
     throw error;
   }
 }
@@ -148,7 +139,8 @@ app.use(async (req, res, next) => {
     console.error('Database connection middleware failed:', error);
     res.status(500).json({ 
       error: 'Database connection failed',
-      message: error.message 
+      message: error.message,
+      advice: 'Check your MONGO_URL environment variable and MongoDB Atlas network settings'
     });
   }
 });
@@ -169,6 +161,33 @@ app.use('/api/auth', require('./routes/auth'));
 app.use('/api/clients', require('./routes/clients'));
 app.use('/api/client', require('./routes/client'));
 app.use('/api/trainers', require('./routes/trainers'));
+
+// Test if routes are working
+app.get('/api/test-routes', async (req, res) => {
+  try {
+    await connectToDatabase();
+    
+    // Test if we can access collections
+    const collections = await mongoose.connection.db.listCollections().toArray();
+    const collectionNames = collections.map(c => c.name);
+    
+    res.json({
+      success: true,
+      message: 'Routes are working',
+      database: mongoose.connection.name,
+      collections: collectionNames,
+      clientCount: await Client.countDocuments(),
+      userCount: await User.countDocuments(),
+      attendanceCount: await Attendance.countDocuments()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      advice: 'Database operations failing'
+    });
+  }
+});
 
 // Add a test upload endpoint for Vercel file handling
 app.post('/api/test-upload', upload.single('image'), async (req, res) => {
@@ -213,39 +232,57 @@ app.post('/api/test-upload', upload.single('image'), async (req, res) => {
 // Health check endpoint
 app.get('/api/health', async (req, res) => {
   try {
-    await connectToDatabase(); // Ensure connection
+    await connectToDatabase();
     res.status(200).json({ 
       status: 'OK', 
       mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
       readyState: mongoose.connection.readyState,
       stateDescription: getStateDescription(mongoose.connection.readyState),
       timestamp: new Date().toISOString(),
-      environment: isVercel ? 'vercel' : 'local'
+      environment: isVercel ? 'vercel' : 'local',
+      database: mongoose.connection.name
     });
   } catch (error) {
     res.status(500).json({
       status: 'ERROR',
       mongodb: 'connection_failed',
       error: error.message,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      advice: 'Check MONGO_URL environment variable'
     });
   }
 });
 
 // Simple connection test
-app.get('/api/check-connection', (req, res) => {
+app.get('/api/check-connection', async (req, res) => {
   const mongoURL = process.env.MONGO_URL;
   
-  res.json({
-    hasMongoURL: !!mongoURL,
-    mongoURLLength: mongoURL?.length,
-    connectionState: mongoose.connection.readyState,
-    stateDescription: getStateDescription(mongoose.connection.readyState),
-    environment: process.env.NODE_ENV,
-    isVercel: isVercel,
-    timestamp: new Date().toISOString(),
-    advice: 'If state is 0 (disconnected), check: 1. MongoDB Atlas Network Access (add 0.0.0.0/0) 2. Connection string validity 3. User permissions'
-  });
+  try {
+    await connectToDatabase();
+    
+    res.json({
+      success: true,
+      hasMongoURL: !!mongoURL,
+      mongoURLLength: mongoURL?.length,
+      connectionState: mongoose.connection.readyState,
+      stateDescription: getStateDescription(mongoose.connection.readyState),
+      environment: process.env.NODE_ENV,
+      isVercel: isVercel,
+      database: mongoose.connection.name,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.json({
+      success: false,
+      hasMongoURL: !!mongoURL,
+      mongoURLLength: mongoURL?.length,
+      connectionState: mongoose.connection.readyState,
+      stateDescription: getStateDescription(mongoose.connection.readyState),
+      error: error.message,
+      timestamp: new Date().toISOString(),
+      advice: 'Connection failed. Check MONGO_URL and MongoDB Atlas settings.'
+    });
+  }
 });
 
 // List all environment variables (for debugging - remove in production)
@@ -257,14 +294,15 @@ app.get('/api/debug/env', (req, res) => {
     VERCEL: process.env.VERCEL,
     PORT: process.env.PORT,
     isVercel: isVercel,
+    nodeVersion: process.version,
+    platform: process.platform,
     // Don't show full MONGO_URL for security
   };
   res.json(envVars);
 });
 
-// Direct connection test without mongoose
+// Direct connection test without mongoose - FIXED
 app.get('/api/test-direct-connection', async (req, res) => {
-  const { MongoClient } = require('mongodb');
   const mongoURL = process.env.MONGO_URL;
   
   if (!mongoURL) {
@@ -272,54 +310,66 @@ app.get('/api/test-direct-connection', async (req, res) => {
   }
   
   try {
-    const client = new MongoClient(mongoURL, {
-      serverSelectionTimeoutMS: 10000,
-      socketTimeoutMS: 45000,
-    });
+    // Use mongoose's driver directly
+    const connection = mongoose.connection;
+    if (!connection.db) {
+      await connectToDatabase();
+    }
     
-    console.log(`Testing direct connection to: ${mongoURL.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@')}`);
-    
-    await client.connect();
-    const pingResult = await client.db("admin").command({ ping: 1 });
-    const databases = await client.db().admin().listDatabases();
-    
-    // Check if our database exists
-    const attendanceDB = databases.databases.find(db => db.name === 'attendance');
-    
-    await client.close();
+    const pingResult = await connection.db.admin().ping();
     
     res.json({
       success: true,
       message: 'Direct MongoDB connection successful!',
       ping: pingResult,
-      databaseExists: !!attendanceDB,
-      availableDatabases: databases.databases.map(db => db.name),
-      connectionURL: mongoURL.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@')
+      database: connection.name,
+      host: connection.host,
+      timestamp: new Date().toISOString()
     });
     
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      errorCode: error.code,
-      errorName: error.name,
-      advice: 'The connection string itself is failing. Check: 1. MongoDB Atlas Network Access 2. Username/password 3. Cluster might be paused/sleeping',
-      testCommand: `Try running: mongosh "${mongoURL}"`
-    });
+    // Try direct mongodb driver as fallback
+    try {
+      const { MongoClient } = require('mongodb');
+      const client = new MongoClient(mongoURL);
+      await client.connect();
+      const pingResult = await client.db("admin").command({ ping: 1 });
+      await client.close();
+      
+      res.json({
+        success: true,
+        message: 'MongoDB driver connection successful!',
+        ping: pingResult,
+        driver: 'native-mongodb',
+        timestamp: new Date().toISOString()
+      });
+    } catch (driverError) {
+      res.status(500).json({
+        success: false,
+        error: driverError.message,
+        mongooseError: error.message,
+        advice: 'The connection string itself is failing. Check: 1. MongoDB Atlas Network Access (0.0.0.0/0) 2. Username/password 3. Cluster status',
+        timestamp: new Date().toISOString()
+      });
+    }
   }
 });
 
-// Test MongoDB connection endpoint - UPDATED
+// Test MongoDB connection endpoint
 app.get('/api/test-mongodb', async (req, res) => {
   try {
-    await connectToDatabase(); // Ensure connection
+    await connectToDatabase();
     
     const connectionState = mongoose.connection.readyState;
     
     if (connectionState === 1) {
+      // Try to ping the database
+      const pingResult = await mongoose.connection.db.admin().ping();
+      
       res.json({ 
         status: 'success',
-        message: 'MongoDB is connected',
+        message: 'MongoDB is connected and responsive',
+        ping: pingResult,
         connectionState: connectionState,
         stateDescription: 'connected',
         host: mongoose.connection.host,
@@ -350,7 +400,7 @@ app.get('/api/test-mongodb', async (req, res) => {
 
 app.get('/', async (req, res) => {
   try {
-    await connectToDatabase(); // Ensure connection before rendering
+    await connectToDatabase();
     const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
     const statusClass = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
     const statusIcon = mongoose.connection.readyState === 1 ? '✅' : '❌';
@@ -395,6 +445,9 @@ app.get('/', async (req, res) => {
           <div class="endpoint">
             <a href="/api/debug/env" target="_blank">/api/debug/env</a> - Environment variables
           </div>
+          <div class="endpoint">
+            <a href="/api/test-routes" target="_blank">/api/test-routes</a> - Test API routes
+          </div>
           
           <h3>File Upload Test:</h3>
           <div class="endpoint">
@@ -411,6 +464,7 @@ app.get('/', async (req, res) => {
           
           <p><strong>Environment:</strong> ${isVercel ? 'Vercel (Serverless)' : 'Local Development'}</p>
           <p><strong>Database:</strong> ${mongoose.connection.name || 'Not connected'}</p>
+          <p><strong>Mongoose Version:</strong> ${mongoose.version}</p>
         </div>
         
         <script>
@@ -440,10 +494,13 @@ app.get('/', async (req, res) => {
     res.send(`
       <!DOCTYPE html>
       <html>
-      <head><title>Error</title></head>
+      <head><title>Error</title><style>body{font-family:Arial;margin:40px;}</style></head>
       <body>
-        <h1>Database Connection Error</h1>
-        <p>${error.message}</p>
+        <h1>⚠️ Database Connection Error</h1>
+        <p><strong>Error:</strong> ${error.message}</p>
+        <p><strong>Advice:</strong> Check your MONGO_URL environment variable in Vercel settings</p>
+        <p><strong>Current MONGO_URL:</strong> ${process.env.MONGO_URL ? 'Set (' + process.env.MONGO_URL.length + ' chars)' : 'Not set'}</p>
+        <p><a href="/api/debug/env">View Environment Variables</a></p>
       </body>
       </html>
     `);
