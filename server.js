@@ -75,25 +75,83 @@ if (isVercel) {
 }
 
 // MongoDB Connection with retry logic
+// MongoDB Connection with better error handling
 const connectDB = async () => {
   try {
-    await mongoose.connect(process.env.MONGO_URL, {
+    const mongoURL = process.env.MONGO_URL;
+    
+    if (!mongoURL) {
+      console.error("❌ MONGO_URL is not defined in environment variables");
+      return;
+    }
+    
+    console.log("🔗 Connecting to MongoDB...");
+    
+    await mongoose.connect(mongoURL, {
       useNewUrlParser: true,
       useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 5000,
+      serverSelectionTimeoutMS: 10000, // 10 seconds
       socketTimeoutMS: 45000,
+      maxPoolSize: 10,
     });
-    console.log("MongoDB connected successfully");
+    
+    console.log("✅ MongoDB connected successfully");
+    
+    // Listen to connection events
+    mongoose.connection.on('error', (err) => {
+      console.error('❌ MongoDB connection error:', err);
+    });
+    
+    mongoose.connection.on('disconnected', () => {
+      console.log('⚠️ MongoDB disconnected');
+    });
+    
+    mongoose.connection.on('reconnected', () => {
+      console.log('🔌 MongoDB reconnected');
+    });
+    
   } catch (err) {
-    console.error("MongoDB connection error:", err);
-    // In serverless, we might want to exit gracefully
-    if (isVercel) {
-      console.log("Continuing without MongoDB connection in Vercel environment");
-    }
+    console.error("❌ MongoDB connection failed:", err.message);
+    console.log("Connection URL used:", process.env.MONGO_URL?.replace(/\/\/(.*?)@/, '//***:***@'));
   }
 };
 
 connectDB();
+
+// Test MongoDB connection endpoint
+app.get('/api/test-mongodb', async (req, res) => {
+  try {
+    // Try to ping MongoDB
+    await mongoose.connection.db.admin().ping();
+    res.json({ 
+      status: 'success',
+      message: 'MongoDB is connected and responsive',
+      connectionState: mongoose.connection.readyState,
+      host: mongoose.connection.host,
+      database: mongoose.connection.name
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: 'MongoDB connection failed',
+      error: error.message,
+      connectionState: mongoose.connection.readyState
+    });
+  }
+});
+
+// List all environment variables (for debugging - remove in production)
+app.get('/api/debug/env', (req, res) => {
+  const envVars = {
+    NODE_ENV: process.env.NODE_ENV,
+    MONGO_URL_SET: !!process.env.MONGO_URL,
+    MONGO_URL_LENGTH: process.env.MONGO_URL?.length,
+    VERCEL: process.env.VERCEL,
+    PORT: process.env.PORT,
+    // Don't show full MONGO_URL for security
+  };
+  res.json(envVars);
+});
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
