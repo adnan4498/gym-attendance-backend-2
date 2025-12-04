@@ -10,6 +10,9 @@ require('dotenv').config();
 
 const Client = require('./models/Client');
 
+// IMPORTANT: For Vercel, we need to handle serverless environment
+const isVercel = process.env.VERCEL === '1';
+
 // Multer configuration for file uploads
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -39,28 +42,58 @@ const upload = multer({
   }
 });
 
-// Create uploads directory if it doesn't exist
-if (!fs.existsSync('uploads')) {
-  fs.mkdirSync('uploads');
+// For Vercel, create uploads directory in /tmp (writable directory)
+if (isVercel) {
+  const tmpUploadsPath = '/tmp/uploads';
+  if (!fs.existsSync(tmpUploadsPath)) {
+    fs.mkdirSync(tmpUploadsPath, { recursive: true });
+  }
+  // Update multer storage for Vercel
+  storage.destination = tmpUploadsPath;
+} else {
+  // Local development
+  if (!fs.existsSync('uploads')) {
+    fs.mkdirSync('uploads');
+  }
 }
+
 const Attendance = require('./models/Attendance');
 const User = require('./models/User');
 
 const app = express();
-const PORT = process.env.PORT || 5000 ;
+const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
 
-// MongoDB Connection
-mongoose.connect(process.env.MONGO_URL, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-})
-.then(() => console.log("MongoDB connected"))
-.catch(err => console.log("MongoDB connection error:", err));
+// Serve uploaded files - handle Vercel's /tmp directory
+if (isVercel) {
+  app.use('/uploads', express.static('/tmp/uploads'));
+} else {
+  app.use('/uploads', express.static('uploads'));
+}
+
+// MongoDB Connection with retry logic
+const connectDB = async () => {
+  try {
+    await mongoose.connect(process.env.MONGO_URL, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    });
+    console.log("MongoDB connected successfully");
+  } catch (err) {
+    console.error("MongoDB connection error:", err);
+    // In serverless, we might want to exit gracefully
+    if (isVercel) {
+      console.log("Continuing without MongoDB connection in Vercel environment");
+    }
+  }
+};
+
+connectDB();
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
@@ -68,17 +101,32 @@ app.use('/api/clients', require('./routes/clients'));
 app.use('/api/client', require('./routes/client'));
 app.use('/api/trainers', require('./routes/trainers'));
 
-app.get('/', (req, res) => {
-  res.send('Attendance Backend API');
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'OK', 
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    timestamp: new Date().toISOString()
+  });
 });
 
-// Evolution API WhatsApp setup
-const evolutionApiUrl = process.env.EVOLUTION_API_URL; // e.g., 'http://localhost:8080'
+app.get('/', (req, res) => {
+  res.send('Attendance Backend API - Deployed on Vercel');
+});
+
+// Evolution API WhatsApp setup (optional - remove if not needed)
+const evolutionApiUrl = process.env.EVOLUTION_API_URL;
 const evolutionApiKey = process.env.EVOLUTION_API_KEY;
-const evolutionInstance = process.env.EVOLUTION_INSTANCE; // e.g., 'instance1'
+const evolutionInstance = process.env.EVOLUTION_INSTANCE;
 
 // Function to send WhatsApp message
 const sendWhatsAppMessage = async (to, message) => {
+  // Check if Evolution API is configured
+  if (!evolutionApiUrl || !evolutionApiKey || !evolutionInstance) {
+    console.log('Evolution API not configured, skipping WhatsApp message');
+    return;
+  }
+  
   try {
     const response = await axios.post(`${evolutionApiUrl}/message/sendText/${evolutionInstance}`, {
       number: to,
@@ -98,6 +146,13 @@ const sendWhatsAppMessage = async (to, message) => {
 // Function to check and send fee reminders
 const sendFeeReminders = async () => {
   try {
+    // In Vercel serverless, cron jobs should be handled differently
+    // Consider using Vercel Cron Jobs or external cron service
+    if (isVercel) {
+      console.log('Cron jobs disabled in Vercel serverless environment');
+      return;
+    }
+    
     const clients = await Client.find({});
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -129,6 +184,12 @@ const sendFeeReminders = async () => {
 // Function to backup data
 const backupData = async () => {
   try {
+    // Skip backup in Vercel serverless environment
+    if (isVercel) {
+      console.log('Backup disabled in Vercel serverless environment');
+      return;
+    }
+    
     const backupDir = path.join(__dirname, 'backups');
     if (!fs.existsSync(backupDir)) {
       fs.mkdirSync(backupDir);
@@ -163,17 +224,22 @@ const backupData = async () => {
   }
 };
 
-// Schedule daily check at 9 AM
-cron.schedule('0 9 * * *', () => {
-  console.log('Running daily fee reminder check');
-  sendFeeReminders();
-});
+// Schedule tasks only if not in Vercel serverless
+if (!isVercel) {
+  // Schedule daily check at 9 AM
+  cron.schedule('0 9 * * *', () => {
+    console.log('Running daily fee reminder check');
+    sendFeeReminders();
+  });
 
-// Schedule daily backup at 2 AM
-cron.schedule('0 2 * * *', () => {
-  console.log('Running daily data backup');
-  backupData();
-});
+  // Schedule daily backup at 2 AM
+  cron.schedule('0 2 * * *', () => {
+    console.log('Running daily data backup');
+    backupData();
+  });
+} else {
+  console.log('Cron jobs disabled for Vercel deployment');
+}
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -193,7 +259,12 @@ app.use((err, req, res, next) => {
   res.status(500).json({ message: err.message || 'Internal server error' });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// For Vercel deployment, export the app as a serverless function
+if (isVercel) {
+  module.exports = app;
+} else {
+  // For local development
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
