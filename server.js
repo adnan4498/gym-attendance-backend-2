@@ -76,69 +76,123 @@ if (isVercel) {
 
 // MongoDB Connection with retry logic
 // MongoDB Connection with better error handling
+// MongoDB Connection with better error handling
 const connectDB = async () => {
-  try {
-    const mongoURL = process.env.MONGO_URL;
-    
-    if (!mongoURL) {
-      console.error("❌ MONGO_URL is not defined in environment variables");
-      return;
+  const maxRetries = 3;
+  let retries = 0;
+  
+  const connectWithRetry = async () => {
+    try {
+      const mongoURL = process.env.MONGO_URL;
+      
+      if (!mongoURL) {
+        console.error("❌ MONGO_URL is not defined in environment variables");
+        return false;
+      }
+      
+      console.log(`🔗 Attempting MongoDB connection (attempt ${retries + 1}/${maxRetries})...`);
+      
+      // Log a masked version of the URL for debugging (hides password)
+      const maskedURL = mongoURL.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@');
+      console.log(`🔗 Connecting to: ${maskedURL}`);
+      
+      await mongoose.connect(mongoURL, {
+        useNewUrlParser: true,
+        useUnifiedTopology: true,
+        serverSelectionTimeoutMS: 30000, // 30 seconds
+        socketTimeoutMS: 45000,
+        maxPoolSize: 10,
+      });
+      
+      console.log("✅ MongoDB connected successfully");
+      console.log(`📊 Database: ${mongoose.connection.name}`);
+      console.log(`🌐 Host: ${mongoose.connection.host}`);
+      
+      return true;
+      
+    } catch (err) {
+      retries++;
+      console.error(`❌ MongoDB connection failed (attempt ${retries}/${maxRetries}):`, err.message);
+      
+      if (retries < maxRetries) {
+        console.log(`⏳ Retrying in 5 seconds...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        return connectWithRetry();
+      } else {
+        console.error("💥 Max retries reached. Could not connect to MongoDB.");
+        return false;
+      }
     }
-    
-    console.log("🔗 Connecting to MongoDB...");
-    
-    await mongoose.connect(mongoURL, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 10000, // 10 seconds
-      socketTimeoutMS: 45000,
-      maxPoolSize: 10,
-    });
-    
-    console.log("✅ MongoDB connected successfully");
-    
-    // Listen to connection events
-    mongoose.connection.on('error', (err) => {
-      console.error('❌ MongoDB connection error:', err);
-    });
-    
-    mongoose.connection.on('disconnected', () => {
-      console.log('⚠️ MongoDB disconnected');
-    });
-    
-    mongoose.connection.on('reconnected', () => {
-      console.log('🔌 MongoDB reconnected');
-    });
-    
-  } catch (err) {
-    console.error("❌ MongoDB connection failed:", err.message);
-    console.log("Connection URL used:", process.env.MONGO_URL?.replace(/\/\/(.*?)@/, '//***:***@'));
-  }
+  };
+  
+  return connectWithRetry();
 };
-
-connectDB();
 
 // Test MongoDB connection endpoint
 app.get('/api/test-mongodb', async (req, res) => {
   try {
-    // Try to ping MongoDB
-    await mongoose.connection.db.admin().ping();
-    res.json({ 
-      status: 'success',
-      message: 'MongoDB is connected and responsive',
-      connectionState: mongoose.connection.readyState,
-      host: mongoose.connection.host,
-      database: mongoose.connection.name
-    });
+    const connectionState = mongoose.connection.readyState;
+    
+    // readyState values:
+    // 0 = disconnected
+    // 1 = connected
+    // 2 = connecting
+    // 3 = disconnecting
+    
+    if (connectionState === 1) {
+      // Try to ping MongoDB only if connected
+      try {
+        const pingResult = await mongoose.connection.db.admin().ping();
+        res.json({ 
+          status: 'success',
+          message: 'MongoDB is connected and responsive',
+          ping: pingResult,
+          connectionState: connectionState,
+          stateDescription: 'connected',
+          host: mongoose.connection.host,
+          database: mongoose.connection.name,
+          collections: await mongoose.connection.db.listCollections().toArray()
+        });
+      } catch (pingError) {
+        res.json({
+          status: 'warning',
+          message: 'MongoDB appears connected but ping failed',
+          connectionState: connectionState,
+          stateDescription: 'connected (ping failed)',
+          error: pingError.message
+        });
+      }
+    } else {
+      res.status(503).json({
+        status: 'error',
+        message: 'MongoDB is not connected',
+        connectionState: connectionState,
+        stateDescription: getStateDescription(connectionState),
+        advice: 'Check 1) MongoDB Atlas Network Access 2) Connection string 3) Internet connectivity',
+        timestamp: new Date().toISOString()
+      });
+    }
   } catch (error) {
     res.status(500).json({
-      status: 'error',
-      message: 'MongoDB connection failed',
+      status: 'critical_error',
+      message: 'Error testing MongoDB connection',
       error: error.message,
-      connectionState: mongoose.connection.readyState
+      connectionState: mongoose.connection.readyState,
+      stack: process.env.NODE_ENV === 'production' ? undefined : error.stack
     });
   }
 });
+
+// Helper function
+function getStateDescription(state) {
+  const states = {
+    0: 'disconnected',
+    1: 'connected',
+    2: 'connecting',
+    3: 'disconnecting'
+  };
+  return states[state] || 'unknown';
+}
 
 // List all environment variables (for debugging - remove in production)
 app.get('/api/debug/env', (req, res) => {
@@ -166,6 +220,50 @@ app.get('/api/health', (req, res) => {
     mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
     timestamp: new Date().toISOString()
   });
+});
+
+// Simple connection test
+app.get('/api/check-connection', (req, res) => {
+  const mongoURL = process.env.MONGO_URL;
+  
+  res.json({
+    hasMongoURL: !!mongoURL,
+    mongoURLLength: mongoURL?.length,
+    connectionState: mongoose.connection.readyState,
+    stateDescription: getStateDescription(mongoose.connection.readyState),
+    environment: process.env.NODE_ENV,
+    isVercel: process.env.VERCEL === '1',
+    timestamp: new Date().toISOString(),
+    advice: 'If state is 0 (disconnected), check: 1. MongoDB Atlas Network Access (add 0.0.0.0/0) 2. Connection string validity 3. User permissions'
+  });
+});
+
+// Add this test endpoint
+app.get('/api/test-connection-string', async (req, res) => {
+  const { MongoClient } = require('mongodb');
+  const mongoURL = process.env.MONGO_URL;
+  
+  if (!mongoURL) {
+    return res.json({ error: 'No MONGO_URL set' });
+  }
+  
+  try {
+    const client = new MongoClient(mongoURL);
+    await client.connect();
+    await client.db("admin").command({ ping: 1 });
+    await client.close();
+    
+    res.json({ 
+      success: true, 
+      message: 'Connection string is valid and working!' 
+    });
+  } catch (error) {
+    res.json({ 
+      success: false, 
+      error: error.message,
+      advice: 'Check: 1. Network Access in MongoDB Atlas 2. Username/password 3. Cluster name'
+    });
+  }
 });
 
 app.get('/', (req, res) => {
