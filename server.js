@@ -55,9 +55,12 @@ app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
 // MongoDB Connection
-mongoose.connect(process.env.MONGO_URI || 'mongodb+srv://akhan123456008_db_user:YmFQqOSxQScSSMjX@cluster0.uxjhait.mongodb.net/attendance?appName=cluster0')
-.then(() => console.log('MongoDB connected'))
-.catch(err => console.log('MongoDB connection error:', err));
+mongoose.connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+})
+.then(() => console.log("MongoDB connected"))
+.catch(err => console.log("MongoDB connection error:", err));
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
