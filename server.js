@@ -86,60 +86,72 @@ if (isVercel) {
   app.use('/uploads', express.static('uploads'));
 }
 
-// SIMPLIFIED MongoDB Connection for Vercel
-const connectDB = async () => {
+// FIXED: Global connection caching for Vercel serverless
+let cachedConnection = null;
+
+async function connectToDatabase() {
+  if (cachedConnection && mongoose.connection.readyState === 1) {
+    console.log('✅ Using cached MongoDB connection');
+    return cachedConnection;
+  }
+
   try {
+    console.log('🔗 Creating new MongoDB connection...');
+    
+    // For Vercel, use a simpler connection
     const mongoURL = process.env.MONGO_URL;
     
     if (!mongoURL) {
-      console.error("❌ MONGO_URL is not defined in environment variables");
-      return false;
+      throw new Error('MONGO_URL environment variable is not set');
     }
     
-    console.log("🔗 Connecting to MongoDB...");
+    // Mask password in logs
+    const maskedURL = mongoURL.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@');
+    console.log(`📡 Connecting to: ${maskedURL}`);
     
-    // Simple connection without complex options
-    await mongoose.connect(mongoURL, {
+    // Connect with optimal settings for serverless
+    const connection = await mongoose.connect(mongoURL, {
       useNewUrlParser: true,
       useUnifiedTopology: true,
-      serverSelectionTimeoutMS: 10000, // 10 seconds timeout
+      maxPoolSize: 1, // Important for serverless - keep pool small
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
     });
     
-    console.log("✅ MongoDB connected successfully");
-    console.log(`📊 Database: ${mongoose.connection.name}`);
-    console.log(`🌐 Host: ${mongoose.connection.host}`);
+    console.log('✅ MongoDB connected successfully!');
+    cachedConnection = connection;
     
-    return true;
+    // Handle connection events
+    mongoose.connection.on('error', (err) => {
+      console.error('❌ MongoDB connection error:', err);
+      cachedConnection = null;
+    });
+    
+    mongoose.connection.on('disconnected', () => {
+      console.log('⚠️ MongoDB disconnected');
+      cachedConnection = null;
+    });
+    
+    return connection;
   } catch (error) {
-    console.error("❌ MongoDB connection failed:", error.message);
-    
-    // Try one more time with basic options
-    try {
-      console.log("🔄 Trying alternative connection method...");
-      await mongoose.connect(mongoURL);
-      console.log("✅ MongoDB connected on second attempt");
-      return true;
-    } catch (retryError) {
-      console.error("💥 Second connection attempt failed:", retryError.message);
-      return false;
-    }
+    console.error('❌ MongoDB connection failed:', error.message);
+    throw error;
   }
-};
+}
 
-// Initialize DB connection immediately
-let isDBConnected = false;
-(async () => {
+// FIXED: Middleware to ensure DB connection before routes
+app.use(async (req, res, next) => {
   try {
-    isDBConnected = await connectDB();
-    if (isDBConnected) {
-      console.log("🚀 Database connection initialized successfully");
-    } else {
-      console.error("💥 Failed to initialize database connection");
-    }
+    await connectToDatabase();
+    next();
   } catch (error) {
-    console.error("💥 Error initializing database:", error);
+    console.error('Database connection middleware failed:', error);
+    res.status(500).json({ 
+      error: 'Database connection failed',
+      message: error.message 
+    });
   }
-})();
+});
 
 // Helper function
 function getStateDescription(state) {
@@ -199,13 +211,25 @@ app.post('/api/test-upload', upload.single('image'), async (req, res) => {
 });
 
 // Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'OK', 
-    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-    timestamp: new Date().toISOString(),
-    environment: isVercel ? 'vercel' : 'local'
-  });
+app.get('/api/health', async (req, res) => {
+  try {
+    await connectToDatabase(); // Ensure connection
+    res.status(200).json({ 
+      status: 'OK', 
+      mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+      readyState: mongoose.connection.readyState,
+      stateDescription: getStateDescription(mongoose.connection.readyState),
+      timestamp: new Date().toISOString(),
+      environment: isVercel ? 'vercel' : 'local'
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'ERROR',
+      mongodb: 'connection_failed',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // Simple connection test
@@ -288,25 +312,15 @@ app.get('/api/test-direct-connection', async (req, res) => {
 // Test MongoDB connection endpoint - UPDATED
 app.get('/api/test-mongodb', async (req, res) => {
   try {
+    await connectToDatabase(); // Ensure connection
+    
     const connectionState = mongoose.connection.readyState;
     
-    // If disconnected, try to reconnect once
-    if (connectionState === 0) {
-      console.log("⚠️ MongoDB disconnected, attempting quick reconnect...");
-      try {
-        await mongoose.connect(process.env.MONGO_URL);
-      } catch (reconnectError) {
-        console.log("❌ Quick reconnect failed:", reconnectError.message);
-      }
-    }
-    
-    const newConnectionState = mongoose.connection.readyState;
-    
-    if (newConnectionState === 1) {
+    if (connectionState === 1) {
       res.json({ 
         status: 'success',
         message: 'MongoDB is connected',
-        connectionState: newConnectionState,
+        connectionState: connectionState,
         stateDescription: 'connected',
         host: mongoose.connection.host,
         database: mongoose.connection.name,
@@ -314,36 +328,14 @@ app.get('/api/test-mongodb', async (req, res) => {
         environment: isVercel ? 'vercel' : 'local'
       });
     } else {
-      // Test the connection string directly
-      const { MongoClient } = require('mongodb');
-      const mongoURL = process.env.MONGO_URL;
-      
-      try {
-        const client = new MongoClient(mongoURL, {
-          serverSelectionTimeoutMS: 10000
-        });
-        await client.connect();
-        await client.db("admin").command({ ping: 1 });
-        await client.close();
-        
-        res.json({
-          status: 'partial_success',
-          message: 'MongoDB connection string works, but mongoose is disconnected',
-          mongooseState: newConnectionState,
-          directConnection: 'success',
-          advice: 'Mongoose connection may have timed out. The connection string itself is valid.'
-        });
-      } catch (directError) {
-        res.status(503).json({
-          status: 'error',
-          message: 'MongoDB connection failed',
-          connectionState: newConnectionState,
-          stateDescription: 'disconnected',
-          directConnectionError: directError.message,
-          advice: `Check: 1. Network Access in MongoDB Atlas (you have 0.0.0.0/0) 2. Connection string 3. Try this exact URL in MongoDB Compass: ${mongoURL?.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@')}`,
-          timestamp: new Date().toISOString()
-        });
-      }
+      res.status(503).json({
+        status: 'error',
+        message: 'MongoDB is not connected',
+        connectionState: connectionState,
+        stateDescription: getStateDescription(connectionState),
+        advice: 'Database connection failed. Check MongoDB Atlas settings.',
+        timestamp: new Date().toISOString()
+      });
     }
   } catch (error) {
     res.status(500).json({
@@ -356,87 +348,106 @@ app.get('/api/test-mongodb', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Gym Attendance Backend</title>
-      <style>
-        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
-        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #333; }
-        .status { padding: 10px; margin: 10px 0; border-radius: 5px; font-weight: bold; }
-        .connected { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .disconnected { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .endpoint { background: #e9ecef; padding: 10px; margin: 10px 0; border-radius: 5px; }
-        a { color: #007bff; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        code { background: #f8f9fa; padding: 2px 5px; border-radius: 3px; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <h1>🏋️ Gym Attendance Backend API</h1>
-        <p>Backend successfully deployed on Vercel</p>
-        
-        <div class="status ${mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'}">
-          MongoDB Status: ${mongoose.connection.readyState === 1 ? '✅ CONNECTED' : '❌ DISCONNECTED'}
-        </div>
-        
-        <h3>Test Endpoints:</h3>
-        <div class="endpoint">
-          <a href="/api/health" target="_blank">/api/health</a> - Health check
-        </div>
-        <div class="endpoint">
-          <a href="/api/check-connection" target="_blank">/api/check-connection</a> - Connection status
-        </div>
-        <div class="endpoint">
-          <a href="/api/test-direct-connection" target="_blank">/api/test-direct-connection</a> - Direct MongoDB test
-        </div>
-        <div class="endpoint">
-          <a href="/api/debug/env" target="_blank">/api/debug/env</a> - Environment variables
-        </div>
-        
-        <h3>File Upload Test:</h3>
-        <div class="endpoint">
-          <form id="uploadForm">
-            <input type="file" name="image" accept="image/*" required>
-            <button type="submit">Test Upload</button>
-          </form>
-          <div id="uploadResult"></div>
-        </div>
-        
-        <p><strong>Frontend Configuration:</strong></p>
-        <p>Update your frontend .env file with:</p>
-        <code>VITE_API_URL=https://gym-attendance-backend-2.vercel.app</code>
-        
-        <p><strong>Environment:</strong> ${isVercel ? 'Vercel (Serverless)' : 'Local Development'}</p>
-      </div>
-      
-      <script>
-        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
-          e.preventDefault();
-          const formData = new FormData();
-          formData.append('image', e.target.image.files[0]);
+app.get('/', async (req, res) => {
+  try {
+    await connectToDatabase(); // Ensure connection before rendering
+    const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+    const statusClass = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+    const statusIcon = mongoose.connection.readyState === 1 ? '✅' : '❌';
+    
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Gym Attendance Backend</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+          .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          h1 { color: #333; }
+          .status { padding: 10px; margin: 10px 0; border-radius: 5px; font-weight: bold; }
+          .connected { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+          .disconnected { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+          .endpoint { background: #e9ecef; padding: 10px; margin: 10px 0; border-radius: 5px; }
+          a { color: #007bff; text-decoration: none; }
+          a:hover { text-decoration: underline; }
+          code { background: #f8f9fa; padding: 2px 5px; border-radius: 3px; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>🏋️ Gym Attendance Backend API</h1>
+          <p>Backend successfully deployed on Vercel</p>
           
-          try {
-            const response = await fetch('/api/test-upload', {
-              method: 'POST',
-              body: formData
-            });
-            const result = await response.json();
-            document.getElementById('uploadResult').innerHTML = 
-              '<pre>' + JSON.stringify(result, null, 2) + '</pre>';
-          } catch (error) {
-            document.getElementById('uploadResult').innerHTML = 
-              'Error: ' + error.message;
-          }
-        });
-      </script>
-    </body>
-    </html>
-  `);
+          <div class="status ${statusClass}">
+            MongoDB Status: ${statusIcon} ${dbStatus.toUpperCase()} (State: ${mongoose.connection.readyState})
+          </div>
+          
+          <h3>Test Endpoints:</h3>
+          <div class="endpoint">
+            <a href="/api/health" target="_blank">/api/health</a> - Health check
+          </div>
+          <div class="endpoint">
+            <a href="/api/check-connection" target="_blank">/api/check-connection</a> - Connection status
+          </div>
+          <div class="endpoint">
+            <a href="/api/test-direct-connection" target="_blank">/api/test-direct-connection</a> - Direct MongoDB test
+          </div>
+          <div class="endpoint">
+            <a href="/api/debug/env" target="_blank">/api/debug/env</a> - Environment variables
+          </div>
+          
+          <h3>File Upload Test:</h3>
+          <div class="endpoint">
+            <form id="uploadForm">
+              <input type="file" name="image" accept="image/*" required>
+              <button type="submit">Test Upload</button>
+            </form>
+            <div id="uploadResult"></div>
+          </div>
+          
+          <p><strong>Frontend Configuration:</strong></p>
+          <p>Update your frontend .env file with:</p>
+          <code>VITE_API_URL=https://gym-attendance-backend-2.vercel.app</code>
+          
+          <p><strong>Environment:</strong> ${isVercel ? 'Vercel (Serverless)' : 'Local Development'}</p>
+          <p><strong>Database:</strong> ${mongoose.connection.name || 'Not connected'}</p>
+        </div>
+        
+        <script>
+          document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData();
+            formData.append('image', e.target.image.files[0]);
+            
+            try {
+              const response = await fetch('/api/test-upload', {
+                method: 'POST',
+                body: formData
+              });
+              const result = await response.json();
+              document.getElementById('uploadResult').innerHTML = 
+                '<pre>' + JSON.stringify(result, null, 2) + '</pre>';
+            } catch (error) {
+              document.getElementById('uploadResult').innerHTML = 
+                'Error: ' + error.message;
+            }
+          });
+        </script>
+      </body>
+      </html>
+    `);
+  } catch (error) {
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head><title>Error</title></head>
+      <body>
+        <h1>Database Connection Error</h1>
+        <p>${error.message}</p>
+      </body>
+      </html>
+    `);
+  }
 });
 
 // Evolution API WhatsApp setup (optional - remove if not needed)
