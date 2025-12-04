@@ -63,8 +63,14 @@ const User = require('./models/User');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
-app.use(cors());
+// Middleware - UPDATED CORS
+app.use(cors({
+  origin: [
+    'https://gym-attendance-frontend.vercel.app', // Your frontend URL
+    'http://localhost:5173' // Local dev
+  ],
+  credentials: true
+}));
 app.use(express.json());
 
 // Serve uploaded files - handle Vercel's /tmp directory
@@ -74,114 +80,59 @@ if (isVercel) {
   app.use('/uploads', express.static('uploads'));
 }
 
-// MongoDB Connection with retry logic
-// MongoDB Connection with better error handling
-// MongoDB Connection with better error handling
+// SIMPLIFIED MongoDB Connection for Vercel
 const connectDB = async () => {
-  const maxRetries = 3;
-  let retries = 0;
-  
-  const connectWithRetry = async () => {
+  try {
+    const mongoURL = process.env.MONGO_URL;
+    
+    if (!mongoURL) {
+      console.error("❌ MONGO_URL is not defined in environment variables");
+      return false;
+    }
+    
+    console.log("🔗 Connecting to MongoDB...");
+    
+    // Simple connection without complex options
+    await mongoose.connect(mongoURL);
+    
+    console.log("✅ MongoDB connected successfully");
+    console.log(`📊 Database: ${mongoose.connection.name}`);
+    console.log(`🌐 Host: ${mongoose.connection.host}`);
+    
+    return true;
+  } catch (error) {
+    console.error("❌ MongoDB connection failed:", error.message);
+    
+    // Try one more time with basic options
     try {
-      const mongoURL = process.env.MONGO_URL;
-      
-      if (!mongoURL) {
-        console.error("❌ MONGO_URL is not defined in environment variables");
-        return false;
-      }
-      
-      console.log(`🔗 Attempting MongoDB connection (attempt ${retries + 1}/${maxRetries})...`);
-      
-      // Log a masked version of the URL for debugging (hides password)
-      const maskedURL = mongoURL.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@');
-      console.log(`🔗 Connecting to: ${maskedURL}`);
-      
+      console.log("🔄 Trying alternative connection method...");
       await mongoose.connect(mongoURL, {
         useNewUrlParser: true,
         useUnifiedTopology: true,
-        serverSelectionTimeoutMS: 30000, // 30 seconds
-        socketTimeoutMS: 45000,
-        maxPoolSize: 10,
       });
-      
-      console.log("✅ MongoDB connected successfully");
-      console.log(`📊 Database: ${mongoose.connection.name}`);
-      console.log(`🌐 Host: ${mongoose.connection.host}`);
-      
+      console.log("✅ MongoDB connected on second attempt");
       return true;
-      
-    } catch (err) {
-      retries++;
-      console.error(`❌ MongoDB connection failed (attempt ${retries}/${maxRetries}):`, err.message);
-      
-      if (retries < maxRetries) {
-        console.log(`⏳ Retrying in 5 seconds...`);
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        return connectWithRetry();
-      } else {
-        console.error("💥 Max retries reached. Could not connect to MongoDB.");
-        return false;
-      }
+    } catch (retryError) {
+      console.error("💥 Second connection attempt failed:", retryError.message);
+      return false;
     }
-  };
-  
-  return connectWithRetry();
+  }
 };
 
-// Test MongoDB connection endpoint
-app.get('/api/test-mongodb', async (req, res) => {
+// Initialize DB connection immediately
+let isDBConnected = false;
+(async () => {
   try {
-    const connectionState = mongoose.connection.readyState;
-    
-    // readyState values:
-    // 0 = disconnected
-    // 1 = connected
-    // 2 = connecting
-    // 3 = disconnecting
-    
-    if (connectionState === 1) {
-      // Try to ping MongoDB only if connected
-      try {
-        const pingResult = await mongoose.connection.db.admin().ping();
-        res.json({ 
-          status: 'success',
-          message: 'MongoDB is connected and responsive',
-          ping: pingResult,
-          connectionState: connectionState,
-          stateDescription: 'connected',
-          host: mongoose.connection.host,
-          database: mongoose.connection.name,
-          collections: await mongoose.connection.db.listCollections().toArray()
-        });
-      } catch (pingError) {
-        res.json({
-          status: 'warning',
-          message: 'MongoDB appears connected but ping failed',
-          connectionState: connectionState,
-          stateDescription: 'connected (ping failed)',
-          error: pingError.message
-        });
-      }
+    isDBConnected = await connectDB();
+    if (isDBConnected) {
+      console.log("🚀 Database connection initialized successfully");
     } else {
-      res.status(503).json({
-        status: 'error',
-        message: 'MongoDB is not connected',
-        connectionState: connectionState,
-        stateDescription: getStateDescription(connectionState),
-        advice: 'Check 1) MongoDB Atlas Network Access 2) Connection string 3) Internet connectivity',
-        timestamp: new Date().toISOString()
-      });
+      console.error("💥 Failed to initialize database connection");
     }
   } catch (error) {
-    res.status(500).json({
-      status: 'critical_error',
-      message: 'Error testing MongoDB connection',
-      error: error.message,
-      connectionState: mongoose.connection.readyState,
-      stack: process.env.NODE_ENV === 'production' ? undefined : error.stack
-    });
+    console.error("💥 Error initializing database:", error);
   }
-});
+})();
 
 // Helper function
 function getStateDescription(state) {
@@ -193,19 +144,6 @@ function getStateDescription(state) {
   };
   return states[state] || 'unknown';
 }
-
-// List all environment variables (for debugging - remove in production)
-app.get('/api/debug/env', (req, res) => {
-  const envVars = {
-    NODE_ENV: process.env.NODE_ENV,
-    MONGO_URL_SET: !!process.env.MONGO_URL,
-    MONGO_URL_LENGTH: process.env.MONGO_URL?.length,
-    VERCEL: process.env.VERCEL,
-    PORT: process.env.PORT,
-    // Don't show full MONGO_URL for security
-  };
-  res.json(envVars);
-});
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
@@ -238,36 +176,182 @@ app.get('/api/check-connection', (req, res) => {
   });
 });
 
-// Add this test endpoint
-app.get('/api/test-connection-string', async (req, res) => {
+// List all environment variables (for debugging - remove in production)
+app.get('/api/debug/env', (req, res) => {
+  const envVars = {
+    NODE_ENV: process.env.NODE_ENV,
+    MONGO_URL_SET: !!process.env.MONGO_URL,
+    MONGO_URL_LENGTH: process.env.MONGO_URL?.length,
+    VERCEL: process.env.VERCEL,
+    PORT: process.env.PORT,
+    // Don't show full MONGO_URL for security
+  };
+  res.json(envVars);
+});
+
+// Direct connection test without mongoose
+app.get('/api/test-direct-connection', async (req, res) => {
   const { MongoClient } = require('mongodb');
   const mongoURL = process.env.MONGO_URL;
   
   if (!mongoURL) {
-    return res.json({ error: 'No MONGO_URL set' });
+    return res.status(400).json({ error: 'MONGO_URL not set' });
   }
   
   try {
-    const client = new MongoClient(mongoURL);
+    const client = new MongoClient(mongoURL, {
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+    });
+    
+    console.log(`Testing direct connection to: ${mongoURL.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@')}`);
+    
     await client.connect();
-    await client.db("admin").command({ ping: 1 });
+    const pingResult = await client.db("admin").command({ ping: 1 });
+    const databases = await client.db().admin().listDatabases();
+    
+    // Check if our database exists
+    const attendanceDB = databases.databases.find(db => db.name === 'attendance');
+    
     await client.close();
     
-    res.json({ 
-      success: true, 
-      message: 'Connection string is valid and working!' 
+    res.json({
+      success: true,
+      message: 'Direct MongoDB connection successful!',
+      ping: pingResult,
+      databaseExists: !!attendanceDB,
+      availableDatabases: databases.databases.map(db => db.name),
+      connectionURL: mongoURL.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@')
     });
+    
   } catch (error) {
-    res.json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       error: error.message,
-      advice: 'Check: 1. Network Access in MongoDB Atlas 2. Username/password 3. Cluster name'
+      errorCode: error.code,
+      errorName: error.name,
+      advice: 'The connection string itself is failing. Check: 1. MongoDB Atlas Network Access 2. Username/password 3. Cluster might be paused/sleeping',
+      testCommand: `Try running: mongosh "${mongoURL}"`
+    });
+  }
+});
+
+// Test MongoDB connection endpoint - UPDATED
+app.get('/api/test-mongodb', async (req, res) => {
+  try {
+    const connectionState = mongoose.connection.readyState;
+    
+    // If disconnected, try to reconnect once
+    if (connectionState === 0) {
+      console.log("⚠️ MongoDB disconnected, attempting quick reconnect...");
+      try {
+        await mongoose.connect(process.env.MONGO_URL);
+      } catch (reconnectError) {
+        console.log("❌ Quick reconnect failed:", reconnectError.message);
+      }
+    }
+    
+    const newConnectionState = mongoose.connection.readyState;
+    
+    if (newConnectionState === 1) {
+      res.json({ 
+        status: 'success',
+        message: 'MongoDB is connected',
+        connectionState: newConnectionState,
+        stateDescription: 'connected',
+        host: mongoose.connection.host,
+        database: mongoose.connection.name,
+        timestamp: new Date().toISOString()
+      });
+    } else {
+      // Test the connection string directly
+      const { MongoClient } = require('mongodb');
+      const mongoURL = process.env.MONGO_URL;
+      
+      try {
+        const client = new MongoClient(mongoURL, {
+          serverSelectionTimeoutMS: 10000
+        });
+        await client.connect();
+        await client.db("admin").command({ ping: 1 });
+        await client.close();
+        
+        res.json({
+          status: 'partial_success',
+          message: 'MongoDB connection string works, but mongoose is disconnected',
+          mongooseState: newConnectionState,
+          directConnection: 'success',
+          advice: 'Mongoose connection may have timed out. The connection string itself is valid.'
+        });
+      } catch (directError) {
+        res.status(503).json({
+          status: 'error',
+          message: 'MongoDB connection failed',
+          connectionState: newConnectionState,
+          stateDescription: 'disconnected',
+          directConnectionError: directError.message,
+          advice: `Check: 1. Network Access in MongoDB Atlas (you have 0.0.0.0/0) 2. Connection string 3. Try this exact URL in MongoDB Compass: ${mongoURL?.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@')}`,
+          timestamp: new Date().toISOString()
+        });
+      }
+    }
+  } catch (error) {
+    res.status(500).json({
+      status: 'critical_error',
+      message: 'Error testing MongoDB connection',
+      error: error.message,
+      connectionState: mongoose.connection.readyState,
+      timestamp: new Date().toISOString()
     });
   }
 });
 
 app.get('/', (req, res) => {
-  res.send('Attendance Backend API - Deployed on Vercel');
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Gym Attendance Backend</title>
+      <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 5px; font-weight: bold; }
+        .connected { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .disconnected { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .endpoint { background: #e9ecef; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        a { color: #007bff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>🏋️ Gym Attendance Backend API</h1>
+        <p>Backend successfully deployed on Vercel</p>
+        
+        <div class="status ${mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'}">
+          MongoDB Status: ${mongoose.connection.readyState === 1 ? '✅ CONNECTED' : '❌ DISCONNECTED'}
+        </div>
+        
+        <h3>Test Endpoints:</h3>
+        <div class="endpoint">
+          <a href="/api/health" target="_blank">/api/health</a> - Health check
+        </div>
+        <div class="endpoint">
+          <a href="/api/check-connection" target="_blank">/api/check-connection</a> - Connection status
+        </div>
+        <div class="endpoint">
+          <a href="/api/test-direct-connection" target="_blank">/api/test-direct-connection</a> - Direct MongoDB test
+        </div>
+        <div class="endpoint">
+          <a href="/api/debug/env" target="_blank">/api/debug/env</a> - Environment variables
+        </div>
+        
+        <p><strong>Frontend:</strong> Update your frontend .env to use: <code>VITE_API_URL=https://gym-attendance-backend-2.vercel.app</code></p>
+      </div>
+    </body>
+    </html>
+  `);
 });
 
 // Evolution API WhatsApp setup (optional - remove if not needed)
