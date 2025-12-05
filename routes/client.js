@@ -50,16 +50,48 @@ const upload = multer({
   }
 });
 
-// Get all clients
+// Get all clients with photoUrl
 router.get('/all', async (req, res) => {
   try {
     console.log('Fetching all clients...');
     const clients = await Client.find().populate('trainer');
     console.log('Clients found:', clients.length);
-    res.json(clients);
+    
+    // Add photoUrl to each client
+    const clientsWithPhotoUrl = clients.map(client => ({
+      ...client._doc,
+      photoUrl: `/api/client/${client._id}/photo`
+    }));
+    
+    res.json(clientsWithPhotoUrl);
   } catch (err) {
     console.error('Error fetching clients:', err);
     res.status(500).json({ message: err.message });
+  }
+});
+
+// Get client photo (public)
+router.get('/:id/photo', async (req, res) => {
+  try {
+    const client = await Client.findById(req.params.id);
+    
+    if (!client || !client.photo || !client.photo.data) {
+      // Return a default image or 404
+      return res.status(404).json({ error: 'Photo not found' });
+    }
+    
+    // Convert base64 to buffer and send as image
+    const imgBuffer = Buffer.from(client.photo.data, 'base64');
+    
+    // Set proper headers
+    res.set('Content-Type', client.photo.contentType || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
+    
+    res.send(imgBuffer);
+    
+  } catch (error) {
+    console.error('Error serving photo:', error);
+    res.status(500).json({ error: 'Failed to serve photo' });
   }
 });
 
@@ -68,7 +100,14 @@ router.get('/search', async (req, res) => {
   try {
     const { name } = req.query;
     const clients = await Client.find({ name: new RegExp(name, 'i') });
-    res.json(clients);
+    
+    // Add photoUrl to each client
+    const clientsWithPhotoUrl = clients.map(client => ({
+      ...client._doc,
+      photoUrl: `/api/client/${client._id}/photo`
+    }));
+    
+    res.json(clientsWithPhotoUrl);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -178,7 +217,8 @@ router.post('/:id/photo', upload.single('photo'), async (req, res) => {
       client: {
         id: client._id,
         name: client.name,
-        hasPhoto: true
+        hasPhoto: true,
+        photoUrl: `/api/client/${client._id}/photo`
       }
     });
     

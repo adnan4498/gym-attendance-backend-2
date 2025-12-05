@@ -54,9 +54,59 @@ const upload = multer({
 router.get('/', auth, async (req, res) => {
   try {
     const clients = await Client.find().populate('trainer');
-    res.json(clients);
+    
+    // Add photoUrl to each client
+    const clientsWithPhotoUrl = clients.map(client => ({
+      ...client._doc,
+      photoUrl: `/api/clients/${client._id}/photo`
+    }));
+    
+    res.json(clientsWithPhotoUrl);
   } catch (err) {
     res.status(500).json({ message: err.message });
+  }
+});
+
+// Get single client with photoUrl
+router.get('/:id', auth, async (req, res) => {
+  try {
+    const client = await Client.findById(req.params.id).populate('trainer');
+    if (!client) {
+      return res.status(404).json({ message: 'Client not found' });
+    }
+    
+    const clientWithPhotoUrl = {
+      ...client._doc,
+      photoUrl: `/api/clients/${client._id}/photo`
+    };
+    
+    res.json(clientWithPhotoUrl);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Get client photo
+router.get('/:id/photo', async (req, res) => {
+  try {
+    const client = await Client.findById(req.params.id);
+    
+    if (!client || !client.photo || !client.photo.data) {
+      return res.status(404).json({ error: 'Photo not found' });
+    }
+    
+    // Convert base64 to buffer and send as image
+    const imgBuffer = Buffer.from(client.photo.data, 'base64');
+    
+    // Set proper headers
+    res.set('Content-Type', client.photo.contentType || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
+    
+    res.send(imgBuffer);
+    
+  } catch (error) {
+    console.error('Error serving photo:', error);
+    res.status(500).json({ error: 'Failed to serve photo' });
   }
 });
 
@@ -65,7 +115,13 @@ router.post('/', auth, async (req, res) => {
   try {
     const client = new Client(req.body);
     await client.save();
-    res.json(client);
+    
+    const clientWithPhotoUrl = {
+      ...client._doc,
+      photoUrl: `/api/clients/${client._id}/photo`
+    };
+    
+    res.json(clientWithPhotoUrl);
   } catch (err) {
     res.status(400).json({ message: err.message });
   }
@@ -113,7 +169,8 @@ router.post('/:id/photo', auth, upload.single('photo'), async (req, res) => {
       client: {
         id: client._id,
         name: client.name,
-        hasPhoto: true
+        hasPhoto: true,
+        photoUrl: `/api/clients/${client._id}/photo`
       }
     });
     
@@ -130,7 +187,13 @@ router.post('/:id/photo', auth, upload.single('photo'), async (req, res) => {
 router.put('/:id', auth, async (req, res) => {
   try {
     const client = await Client.findByIdAndUpdate(req.params.id, req.body, { new: true });
-    res.json(client);
+    
+    const clientWithPhotoUrl = {
+      ...client._doc,
+      photoUrl: `/api/clients/${client._id}/photo`
+    };
+    
+    res.json(clientWithPhotoUrl);
   } catch (err) {
     res.status(400).json({ message: err.message });
   }
