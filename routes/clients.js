@@ -6,16 +6,31 @@ const fs = require('fs');
 const Client = require('../models/Client');
 const auth = require('../middleware/auth');
 
-// Multer configuration
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, 'uploads/');
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'client-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
+// Check if running on Vercel
+const isVercel = process.env.VERCEL === '1';
+
+// Multer configuration for Vercel compatibility
+let storage;
+
+if (isVercel) {
+  // For Vercel: Use memory storage (files stored in memory)
+  storage = multer.memoryStorage();
+} else {
+  // For local development: Use disk storage
+  storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+      const uploadsDir = path.join(__dirname, '../uploads/');
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+      cb(null, uploadsDir);
+    },
+    filename: function (req, file, cb) {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      cb(null, 'client-' + uniqueSuffix + path.extname(file.originalname));
+    }
+  });
+}
 
 const upload = multer({
   storage: storage,
@@ -34,11 +49,6 @@ const upload = multer({
     }
   }
 });
-
-// Create uploads directory if it doesn't exist
-if (!fs.existsSync('uploads')) {
-  fs.mkdirSync('uploads');
-}
 
 // Get all clients
 router.get('/', auth, async (req, res) => {
@@ -61,31 +71,58 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-// Upload photo for client
+// Upload photo for client (with auth)
 router.post('/:id/photo', auth, upload.single('photo'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: 'No photo uploaded' });
-    }
-
-    const client = await Client.findById(req.params.id);
+    const clientId = req.params.id;
+    const client = await Client.findById(clientId);
+    
     if (!client) {
-      return res.status(404).json({ message: 'Client not found' });
+      return res.status(404).json({ error: 'Client not found' });
     }
-
-    // Remove old photo if exists
-    if (client.photo) {
-      const oldPhotoPath = client.photo.replace('/uploads/', 'uploads/');
-      if (fs.existsSync(oldPhotoPath)) {
-        fs.unlinkSync(oldPhotoPath);
+    
+    if (!req.file) {
+      return res.status(400).json({ error: 'No photo uploaded' });
+    }
+    
+    // Handle Vercel vs local differently
+    if (isVercel) {
+      // Vercel: Store as Base64 in MongoDB
+      client.photo = {
+        data: req.file.buffer.toString('base64'),
+        contentType: req.file.mimetype,
+        uploadedAt: new Date()
+      };
+    } else {
+      // Local development: Store file path
+      // Remove old photo if exists
+      if (client.photo && client.photo.startsWith('/uploads/')) {
+        const oldPhotoPath = path.join(__dirname, '..', client.photo);
+        if (fs.existsSync(oldPhotoPath)) {
+          fs.unlinkSync(oldPhotoPath);
+        }
       }
+      client.photo = `/uploads/${req.file.filename}`;
     }
-
-    client.photo = `/uploads/${req.file.filename}`;
+    
     await client.save();
-    res.json(client);
-  } catch (err) {
-    res.status(400).json({ message: err.message });
+    
+    res.json({
+      success: true,
+      message: 'Photo uploaded successfully',
+      client: {
+        id: client._id,
+        name: client.name,
+        hasPhoto: true
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error uploading photo:', error);
+    res.status(500).json({ 
+      error: 'Failed to upload photo',
+      message: error.message 
+    });
   }
 });
 
